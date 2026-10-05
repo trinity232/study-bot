@@ -11,17 +11,19 @@ import io
 import email
 import html
 import imaplib
+import json
 import logging
 import os
 import re
 import smtplib
 import time
+import urllib.error
+import urllib.request
 from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.utils import parseaddr
 
 from dotenv import load_dotenv
-from openai import OpenAI
 from pypdf import PdfReader
 
 load_dotenv()
@@ -55,10 +57,8 @@ SYSTEM_PROMPT = (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("study-bot")
 # GitHub Models: бесплатно, ключ — токен GitHub (в Actions выдаётся автоматически)
-client = OpenAI(
-    base_url="https://models.github.ai/inference",
-    api_key=os.environ["GITHUB_TOKEN"],
-)
+MODELS_URL = "https://models.github.ai/inference/chat/completions"
+GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 
 
 def decode_str(value):
@@ -120,15 +120,31 @@ def solve(subject, text, files):
             "image_url": {"url": f"data:{ctype};base64,{b64}"},
         })
 
-    resp = client.chat.completions.create(
-        model=MODEL,
-        max_tokens=4000,
-        messages=[
+    body = json.dumps({
+        "model": MODEL,
+        "max_tokens": 4000,
+        "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": content},
         ],
-    )
-    return (resp.choices[0].message.content or "").strip()
+    }).encode()
+    req = urllib.request.Request(MODELS_URL, data=body, method="POST", headers={
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"GitHub Models вернул ошибку {e.code}: {detail}") from None
+
+    try:
+        data = json.loads(raw)
+        return (data["choices"][0]["message"]["content"] or "").strip()
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise RuntimeError(f"Неожиданный ответ GitHub Models: {raw[:500]}") from None
 
 
 def send_reply(original, body):
