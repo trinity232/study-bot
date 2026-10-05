@@ -11,7 +11,6 @@ concurrency:
 
 permissions:
   contents: read
-  models: read
 
 jobs:
   check-mail:
@@ -26,7 +25,11 @@ jobs:
       - run: python bot.py
         env:
           RUN_ONCE: "1"
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_KEY: ${{ secrets.API_KEY }}
+          FOLDER_ID: ${{ secrets.FOLDER_ID }}
+          API_URL: ${{ vars.API_URL }}
+          MODEL: ${{ vars.MODEL }}
+          SUPPORTS_IMAGES: ${{ vars.SUPPORTS_IMAGES }}
           BOT_EMAIL: ${{ secrets.BOT_EMAIL }}
           BOT_PASSWORD: ${{ secrets.BOT_PASSWORD }}
           ALLOWED_SENDER: ${{ secrets.ALLOWED_SENDER }}
