@@ -3,7 +3,7 @@
 
 Ты пишешь письмо с задачей (текст, фото, PDF) со своей бауманской почты
 на отдельный ящик бота. Бот проверяет ящик, отправляет задачу в бесплатную
-нейросеть через GitHub Models и присылает решение ответом на твою почту.
+нейросеть YandexGPT и присылает решение ответом на твою почту.
 """
 
 import base64
@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 from email.header import decode_header, make_header
 from email.message import EmailMessage
-from email.utils import parseaddr
+from email.utils import formatdate, make_msgid, parseaddr
 
 from dotenv import load_dotenv
 from pypdf import PdfReader
@@ -36,7 +36,20 @@ SECRET_TAG = os.getenv("SECRET_TAG", "").strip()  # необязательно: 
 IMAP_HOST = os.getenv("IMAP_HOST", "imap.yandex.ru")
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.yandex.ru")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
-MODEL = os.getenv("MODEL", "openai/gpt-4.1")
+# Нейросеть: YandexGPT (если задан FOLDER_ID) или любой сервис с OpenAI-совместимым API
+FOLDER_ID = os.getenv("FOLDER_ID", "").strip()   # ID каталога в Yandex Cloud
+API_KEY = os.environ["API_KEY"]
+if FOLDER_ID:
+    API_URL = os.getenv("API_URL") or "https://ai.api.cloud.yandex.net/v1/chat/completions"
+    _model = os.getenv("MODEL") or "yandexgpt/latest"
+    MODEL = _model if _model.startswith("gpt://") else f"gpt://{FOLDER_ID}/{_model}"
+    AUTH_HEADER = f"Api-Key {API_KEY}"
+else:
+    API_URL = os.getenv("API_URL") or "https://api.groq.com/openai/v1/chat/completions"
+    MODEL = os.getenv("MODEL") or "openai/gpt-oss-120b"
+    AUTH_HEADER = f"Bearer {API_KEY}"
+# Умеет ли модель читать картинки. YandexGPT не умеет, поэтому по умолчанию выключено
+SUPPORTS_IMAGES = os.getenv("SUPPORTS_IMAGES", "") == "1"
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
 # Сколько секунд один запуск в облаке крутится и проверяет почту
 RUN_SECONDS = int(os.getenv("RUN_SECONDS", "270"))
@@ -56,9 +69,6 @@ SYSTEM_PROMPT = (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("study-bot")
-# GitHub Models: бесплатно, ключ — токен GitHub (в Actions выдаётся автоматически)
-MODELS_URL = "https://models.github.ai/inference/chat/completions"
-GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 
 
 def decode_str(value):
@@ -113,6 +123,10 @@ def solve(subject, text, files):
         "type": "text",
         "text": f"Тема письма: {subject}\n\nТекст письма:\n{text or '(текста нет, смотри вложения)'}",
     }]
+    if files and not SUPPORTS_IMAGES:
+        content[0]["text"] += ("\n\n(К письму приложены картинки, но эта модель их не видит. "
+                               "Если без них условие непонятно, попроси прислать задачу текстом.)")
+        files = []
     for ctype, data in files:
         b64 = base64.standard_b64encode(data).decode()
         content.append({
@@ -128,23 +142,26 @@ def solve(subject, text, files):
             {"role": "user", "content": content},
         ],
     }).encode()
-    req = urllib.request.Request(MODELS_URL, data=body, method="POST", headers={
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
+    headers = {
+        "Authorization": AUTH_HEADER,
         "Content-Type": "application/json",
         "Accept": "application/json",
-    })
+    }
+    if FOLDER_ID:
+        headers["OpenAI-Project"] = FOLDER_ID
+    req = urllib.request.Request(API_URL, data=body, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
             raw = r.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError(f"GitHub Models вернул ошибку {e.code}: {detail}") from None
+        raise RuntimeError(f"Нейросеть вернула ошибку {e.code}: {detail}") from None
 
     try:
         data = json.loads(raw)
         return (data["choices"][0]["message"]["content"] or "").strip()
     except (ValueError, KeyError, IndexError, TypeError):
-        raise RuntimeError(f"Неожиданный ответ GitHub Models: {raw[:500]}") from None
+        raise RuntimeError(f"Неожиданный ответ нейросети: {raw[:500]}") from None
 
 
 def send_reply(original, body):
@@ -153,6 +170,9 @@ def send_reply(original, body):
     reply["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
     reply["From"] = BOT_EMAIL
     reply["To"] = ALLOWED_SENDER
+    # Без даты и Message-ID Яндекс считает письмо подозрительным и режет как спам
+    reply["Date"] = formatdate(localtime=True)
+    reply["Message-ID"] = make_msgid(domain=BOT_EMAIL.split("@")[-1])
     if original["Message-ID"]:
         reply["In-Reply-To"] = original["Message-ID"]
         reply["References"] = original["Message-ID"]
