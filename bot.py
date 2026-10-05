@@ -64,11 +64,6 @@ SYSTEM_PROMPT = (
     "по шагам, чтобы студент понял, как прийти к ответу сам. "
     "Отвечай на русском. Ответ уйдёт обычным текстовым письмом, поэтому не используй "
     "Markdown-разметку (никаких **, ##, таблиц); код оформляй просто отступами. "
-    "Никогда не используй LaTeX (никаких $, \\frac, \\sqrt, \\cdot). Формулы пиши обычным "
-    "текстом и символами Unicode: x², x³, √x, a·b, a/b, ≤, ≥, ≠, π, ∞, ∫, Σ, →. "
-    "Например: (x² + 1)/(2x), √(x + 3), sin²x. "
-    "Если в ответе есть программный код, ставь строку '=== КОД ===' перед ним и строку "
-    "'=== КОНЕЦ КОДА ===' после него, а сам код пиши как есть, без отступов и без ```. "
     "Если условие неполное или неразборчивое, скажи, чего не хватает."
 )
 
@@ -169,53 +164,7 @@ def solve(subject, text, files):
         raise RuntimeError(f"Неожиданный ответ нейросети: {raw[:500]}") from None
 
 
-LATEX_SIMPLE = {
-    r"\cdot": "·", r"\times": "×", r"\le": "≤", r"\leq": "≤", r"\ge": "≥", r"\geq": "≥",
-    r"\ne": "≠", r"\neq": "≠", r"\pm": "±", r"\infty": "∞", r"\pi": "π", r"\to": "→",
-    r"\Rightarrow": "⇒", r"\approx": "≈", r"\int": "∫", r"\sum": "Σ", r"\alpha": "α",
-    r"\beta": "β", r"\bmod": "mod", r"\pmod": "mod", r"\mod": "mod", r"\Delta": "Δ", r"\left": "", r"\right": "", r"\,": " ", r"\;": " ",
-}
-SUPERSCRIPT = str.maketrans("0123456789+-n", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻ⁿ")
-
-
-CODE_START, CODE_END = "=== КОД ===", "=== КОНЕЦ КОДА ==="
-
-
-def clean_answer(text):
-    """Чистит формулы во всём ответе, кроме блоков кода — код остаётся как есть."""
-    text = re.sub(r"```[a-zA-Z+]*\n(.*?)```", lambda m: f"{CODE_START}\n{m.group(1)}{CODE_END}", text, flags=re.S)
-    parts = re.split(r"(=== КОД ===.*?=== КОНЕЦ КОДА ===)", text, flags=re.S)
-    out = []
-    for p in parts:
-        if p.startswith(CODE_START):
-            body = p[len(CODE_START):-len(CODE_END)].strip("\n")
-            out.append("\n" + "-" * 40 + "\n" + body + "\n" + "-" * 40 + "\n")
-        else:
-            out.append(clean_math(p))
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
-
-
-def clean_math(text):
-    """Подчищает LaTeX, если нейросеть всё же его вставила, чтобы письмо читалось."""
-    for _ in range(3):  # вложенные \frac
-        text = re.sub(r"\\[dt]?frac\{([^{}]*)\}\{([^{}]*)\}", r"(\1)/(\2)", text)
-        text = re.sub(r"\\sqrt\{([^{}]*)\}", r"√(\1)", text)
-    text = re.sub(r"\\text\{([^{}]*)\}", r"\1", text)
-    text = re.sub(r"\^\{([0-9+\-n]+)\}", lambda m: m.group(1).translate(SUPERSCRIPT), text)
-    text = re.sub(r"\^([0-9n])", lambda m: m.group(1).translate(SUPERSCRIPT), text)
-    for k, v in sorted(LATEX_SIMPLE.items(), key=lambda kv: -len(kv[0])):
-        text = re.sub(re.escape(k) + r"(?![a-zA-Z])", v, text)
-    text = re.sub(r"\\(sin|cos|tan|tg|ctg|ln|log|lim|max|min)\b", r"\1", text)
-    text = text.replace("\\(", "").replace("\\)", "").replace("\\[", "").replace("\\]", "")
-    text = re.sub(r"^[ \t]*\$\$[ \t]*\n", "", text, flags=re.M)   # строки из одних $$
-    text = text.replace("$$", "").replace("$", "")
-    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)              # **жирный**
-    text = re.sub(r"^#{1,6} +", "", text, flags=re.M)             # ## заголовки
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def build_reply(original, body, as_attachment=False):
+def send_reply(original, body):
     reply = EmailMessage()
     subject = decode_str(original["Subject"])
     reply["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
@@ -227,42 +176,11 @@ def build_reply(original, body, as_attachment=False):
     if original["Message-ID"]:
         reply["In-Reply-To"] = original["Message-ID"]
         reply["References"] = original["Message-ID"]
-    if as_attachment:
-        reply.set_content("Решение во вложенном файле reshenie.txt.")
-        reply.add_attachment(body.encode("utf-8"), maintype="text", subtype="plain",
-                             filename="reshenie.txt")
-    else:
-        reply.set_content(body)
-    return reply
+    reply.set_content(body)
 
-
-def send_reply(original, body):
-    """Отправляет ответ. Если Яндекс режет письмо как спам — шлёт решение файлом,
-    а если и это не прошло — кладёт ответ в папку StudyBot ящика бота, чтобы не потерять."""
-    last_error = None
-    for as_attachment in (False, True):
-        reply = build_reply(original, body, as_attachment)
-        try:
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as smtp:
-                smtp.login(BOT_EMAIL, BOT_PASSWORD)
-                smtp.send_message(reply)
-            if as_attachment:
-                log.info("Обычное письмо не прошло, решение отправлено файлом")
-            return
-        except smtplib.SMTPDataError as e:
-            last_error = e
-            log.warning("Яндекс не принял письмо (%s), пробую другой способ", e.smtp_code)
-
-    try:
-        with imaplib.IMAP4_SSL(IMAP_HOST) as imap:
-            imap.login(BOT_EMAIL, BOT_PASSWORD)
-            imap.create("StudyBot")  # если папка уже есть, сервер просто вернёт ошибку — это нормально
-            imap.append("StudyBot", None, imaplib.Time2Internaldate(time.time()),
-                        build_reply(original, body).as_bytes())
-        log.error("Ответ не удалось отправить, он сохранён в папке StudyBot ящика бота")
-    except Exception:
-        log.exception("Не удалось сохранить ответ в папку StudyBot")
-    raise last_error
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as smtp:
+        smtp.login(BOT_EMAIL, BOT_PASSWORD)
+        smtp.send_message(reply)
 
 
 def check_mailbox():
@@ -286,7 +204,7 @@ def check_mailbox():
             log.info("Новая задача: %s", subject)
             try:
                 text, files = extract(msg)
-                answer = clean_answer(solve(subject, text, files))
+                answer = solve(subject, text, files)
             except Exception as e:
                 log.exception("Не удалось решить задачу")
                 answer = f"Не получилось обработать письмо: {e}"
