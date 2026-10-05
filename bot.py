@@ -63,7 +63,12 @@ SYSTEM_PROMPT = (
     "Тебе присылают учебные задачи по почте. Реши задачу и объясни ход решения "
     "по шагам, чтобы студент понял, как прийти к ответу сам. "
     "Отвечай на русском. Ответ уйдёт обычным текстовым письмом, поэтому не используй "
-    "Markdown-разметку (никаких **, ##, таблиц); код оформляй просто отступами. "
+    "Markdown-разметку (никаких **, ##, таблиц). "
+    "Никогда не используй LaTeX (никаких $, \\frac, \\sqrt, \\cdot). Формулы пиши обычным "
+    "текстом и символами Unicode: x², x³, √x, a·b, a/b, ≤, ≥, ≠, π, ∞, ∫, Σ, →. "
+    "Например: (x² + 1)/(2x), √(x + 3), sin²x. "
+    "Если в ответе есть программный код, ставь строку '=== КОД ===' перед ним и строку "
+    "'=== КОНЕЦ КОДА ===' после него, а сам код пиши как есть, без отступов и без ```. "
     "Если условие неполное или неразборчивое, скажи, чего не хватает."
 )
 
@@ -164,6 +169,51 @@ def solve(subject, text, files):
         raise RuntimeError(f"Неожиданный ответ нейросети: {raw[:500]}") from None
 
 
+LATEX_SIMPLE = {
+    r"\cdot": "·", r"\times": "×", r"\le": "≤", r"\leq": "≤", r"\ge": "≥", r"\geq": "≥",
+    r"\ne": "≠", r"\neq": "≠", r"\pm": "±", r"\infty": "∞", r"\pi": "π", r"\to": "→",
+    r"\Rightarrow": "⇒", r"\approx": "≈", r"\int": "∫", r"\sum": "Σ", r"\alpha": "α",
+    r"\beta": "β", r"\bmod": "mod", r"\pmod": "mod", r"\mod": "mod", r"\Delta": "Δ",
+    r"\left": "", r"\right": "", r"\,": " ", r"\;": " ",
+}
+SUPERSCRIPT = str.maketrans("0123456789+-n", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻ⁿ")
+CODE_START, CODE_END = "=== КОД ===", "=== КОНЕЦ КОДА ==="
+
+
+def clean_math(text):
+    """Подчищает LaTeX, если нейросеть всё же его вставила, чтобы письмо читалось."""
+    for _ in range(3):
+        text = re.sub(r"\\[dt]?frac\{([^{}]*)\}\{([^{}]*)\}", r"(\1)/(\2)", text)
+        text = re.sub(r"\\sqrt\{([^{}]*)\}", r"√(\1)", text)
+    text = re.sub(r"\\text\{([^{}]*)\}", r"\1", text)
+    text = re.sub(r"\^\{([0-9+\-n]+)\}", lambda m: m.group(1).translate(SUPERSCRIPT), text)
+    text = re.sub(r"\^([0-9n])", lambda m: m.group(1).translate(SUPERSCRIPT), text)
+    for k, v in sorted(LATEX_SIMPLE.items(), key=lambda kv: -len(kv[0])):
+        text = re.sub(re.escape(k) + r"(?![a-zA-Z])", v, text)
+    text = re.sub(r"\\(sin|cos|tan|tg|ctg|ln|log|lim|max|min)\b", r"\1", text)
+    for t in ("\\(", "\\)", "\\[", "\\]"):
+        text = text.replace(t, "")
+    text = re.sub(r"^[ \t]*\$\$[ \t]*\n", "", text, flags=re.M)
+    text = text.replace("$$", "").replace("$", "")
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"^#{1,6} +", "", text, flags=re.M)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def clean_answer(text):
+    """Чистит формулы во всём ответе, кроме блоков кода — код остаётся как есть."""
+    text = re.sub(r"```[a-zA-Z+]*\n(.*?)```", lambda m: f"{CODE_START}\n{m.group(1)}{CODE_END}", text, flags=re.S)
+    parts = re.split(r"(=== КОД ===.*?=== КОНЕЦ КОДА ===)", text, flags=re.S)
+    out = []
+    for p in parts:
+        if p.startswith(CODE_START):
+            body = p[len(CODE_START):-len(CODE_END)].strip("\n")
+            out.append("\n" + "-" * 40 + "\n" + body + "\n" + "-" * 40 + "\n")
+        else:
+            out.append(clean_math(p))
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
+
 def send_reply(original, body):
     reply = EmailMessage()
     subject = decode_str(original["Subject"])
@@ -204,7 +254,7 @@ def check_mailbox():
             log.info("Новая задача: %s", subject)
             try:
                 text, files = extract(msg)
-                answer = solve(subject, text, files)
+                answer = clean_answer(solve(subject, text, files))
             except Exception as e:
                 log.exception("Не удалось решить задачу")
                 answer = f"Не получилось обработать письмо: {e}"
